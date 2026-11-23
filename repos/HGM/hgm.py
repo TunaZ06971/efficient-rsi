@@ -265,7 +265,7 @@ def main():
     parser.set_defaults(polyglot=None, cool_down=None, full_eval=None)
 
     args = parser.parse_args()
-    sift.validate_search_budget(args.max_hours)
+    sift.validate_startup(args.max_hours)
 
     overrides = {}
     if args.max_task_evals is not None:

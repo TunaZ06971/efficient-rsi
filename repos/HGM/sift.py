@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -43,9 +44,24 @@ def _hash(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+MODES = ("off", "program", "qwen", "compare")
+
+
+def validate_startup(max_hours):
+    """Called once when a search starts (hgm.py, dgm_search.py): a wrong setting fails here, not
+    child by child inside the search."""
+    mode = os.getenv("SIFT_MODE", "off")
+    if mode not in MODES:
+        raise ValueError(f"SIFT_MODE must be one of {', '.join(MODES)}, not {mode!r}")
+    task_records.validate_switches()
+    order_weight()   # a mistyped SIFT_ORDER_WEIGHT fails at startup, not inside the search loop
+    if mode in ("qwen", "compare"):
+        judge_url()  # metering on without the proxy would leave the judge's GPU time out of the ledger
+    validate_search_budget(max_hours)
+
+
 def validate_search_budget(max_hours):
     """Skipped children do not consume task-evaluation budget, but proposals still cost time."""
-    order_weight()   # a mistyped SIFT_ORDER_WEIGHT fails at startup, not inside the search loop
     enforcing = os.getenv("SIFT_ENFORCE", "0") == "1" and os.getenv("SIFT_MODE", "off") in ("program", "qwen")
     if enforcing and (max_hours is None or not math.isfinite(max_hours) or max_hours <= 0):
         raise ValueError("SIFT_ENFORCE=1 requires a positive finite --max_hours: skipped children do not consume the task budget")
@@ -156,7 +172,8 @@ def build_input(initial_path, ancestor_patches, child_patch, parent_dir, *, agen
             "parent_history": history,
             "parent_fingerprints": {p: _hash(s) for p, s in parent.items()},
             "child_fingerprints": {p: _hash(s) for p, s in child.items()},
-            "changed_files": changed, "parent_files": {}, "child_files": {}, "omitted_files": []}
+            "changed_files": changed, "parent_files": {}, "child_files": {}, "omitted_files": [],
+            "startup": startup_facts(child, entry, agent_kind)}
     diff = Path(child_patch).read_text()
     view["diff"] = diff[:16000]
     view["diff_truncated"] = len(diff) > 16000
@@ -188,9 +205,107 @@ def build_input(initial_path, ancestor_patches, child_patch, parent_dir, *, agen
     return view
 
 
+# The command line polyglot/harness.py always passes to coding_agent.py (process_entry).
+LAUNCH_FLAGS = ("problem_statement", "git_dir", "chat_history_file", "base_commit", "outdir",
+                "test_description", "language", "model", "timeout")
+
+
+def _module_file(files, name):
+    """The snapshot file that `import name` loads, or None (standard library, installed, missing)."""
+    base = name.replace(".", "/")
+    for cand in (base + ".py", base + "/__init__.py"):
+        if cand in files:
+            return cand
+    return None
+
+
+def _unguarded_imports(tree):
+    """Modules imported by the module body itself (not inside try, if, def or class): these run at import."""
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            yield from (a.name for a in n.names)
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            yield n.module
+            yield from (f"{n.module}.{a.name}" for a in n.names)
+
+
+def startup_facts(files, entry, agent_kind):
+    """Definite startup failures, read from the child's full source (nothing is run).
+
+    A finding here means the agent cannot reach its first model call on any task:
+      entry   coding_agent.py has no `if __name__ == "__main__":` block, so it does nothing;
+      flags   its argparse rejects a flag of the fixed launch command (and no parse_known_args);
+      tools   a tools/*.py lacks tool_info or tool_function: load_all_tools raises, the error is
+              swallowed and the model is never called;
+      syntax  a file that starts with the agent does not parse: the entry, every tools/*.py, and
+              every repo module imported by those files' own bodies (not inside try/if/def).
+    entry, flags and tools apply to efficient-rsi's original agent; little-coder's entry and tool
+    registry are frozen (lc_integration.FROZEN), so only syntax applies there. Syntax needs a host
+    Python >= 3.11 (the task images run 3.11); on an older host it is only a warning.
+    """
+    hard, warnings = [], []
+    parsed = {}
+    def parse(name):
+        if name not in parsed:
+            try:
+                parsed[name] = ast.parse(files[name], filename=name, feature_version=(3, 11))
+            except SyntaxError as exc:
+                parsed[name] = exc
+        return parsed[name]
+    tools = [] if agent_kind == "littlecoder" else sorted(
+        n for n in files if re.fullmatch(r"tools/[^/]+\.py", n) and n != "tools/__init__.py")
+    roots = ([entry] if entry in files else []) + tools
+    loaded, queue = set(), list(roots)
+    while queue:
+        name = queue.pop()
+        if name in loaded:
+            continue
+        loaded.add(name)
+        tree = parse(name)
+        if isinstance(tree, SyntaxError):
+            finding = {"rule": "syntax", "file": name, "line": tree.lineno, "reason": str(tree)}
+            (hard if sys.version_info >= (3, 11) else warnings).append(finding)
+            continue
+        for mod in _unguarded_imports(tree):
+            dep = _module_file(files, mod)
+            if dep and dep.endswith(".py"):
+                queue.append(dep)
+    if agent_kind != "littlecoder" and entry in files:
+        src = files[entry]
+        if not re.search(r'^if\s+__name__\s*==\s*[\'"]__main__[\'"]', src, re.M):
+            hard.append({"rule": "entry", "file": entry, "reason": "No `if __name__ == \"__main__\":` block: the agent exits without doing anything"})
+        accepted = set(re.findall(r'add_argument\(\s*[\'"]--([A-Za-z0-9_\-]+)', src))
+        missing = [f for f in LAUNCH_FLAGS if f not in accepted]
+        if missing and "parse_known_args" not in src:
+            hard.append({"rule": "flags", "file": entry, "missing": missing,
+                         "reason": "argparse rejects the fixed launch flags --" + ", --".join(missing)})
+        for name in tools:
+            tree = parse(name)
+            if isinstance(tree, SyntaxError):
+                continue
+            defined = set()
+            for n in tree.body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(n.name)
+                elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    defined |= {t.id for t in targets if isinstance(t, ast.Name)}
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    defined |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            lacking = [f for f in ("tool_info", "tool_function") if f not in defined]
+            if lacking:
+                hard.append({"rule": "tools", "file": name, "missing": lacking,
+                             "reason": "load_all_tools raises on this file; the error is swallowed and the model is never called"})
+    unloaded_syntax = [n for n in files if n.endswith(".py") and n not in loaded and isinstance(parse(n), SyntaxError)]
+    for name in unloaded_syntax:
+        warnings.append({"rule": "syntax", "file": name, "line": parsed[name].lineno,
+                         "reason": "Does not parse, but is not loaded at startup; not a definite failure"})
+    return {"version": "startup-v1", "hard": hard, "warnings": warnings, "loaded": sorted(loaded)}
+
+
 def judge_message(view):
-    """What Qwen reads: the view without per-file fingerprints (the program check still uses them)."""
-    return {k: v for k, v in view.items() if k not in ("parent_fingerprints", "child_fingerprints")}
+    """What Qwen reads: the view without per-file fingerprints and the program's startup findings."""
+    return {k: v for k, v in view.items() if k not in ("parent_fingerprints", "child_fingerprints", "startup")}
 
 
 def program_judge(view):
@@ -202,8 +317,13 @@ def program_judge(view):
     hard = []
     if entry not in view["child_fingerprints"]:
         hard.append({"rule": "missing_entry", "file": entry, "reason": "The configured entry file does not exist"})
-    # Syntax errors in the entry file always prevent Python from starting it. Other files
-    # may be optional/unreachable, so report them without claiming definite startup failure.
+    # Startup facts (startup_facts) come from the child's full source: entry, flags, tools, and
+    # syntax of every file loaded at startup. Inputs saved before they existed fall back to the
+    # files in the view: a syntax error is certain only in the entry file.
+    startup = view.get("startup")
+    if startup:
+        hard.extend(startup["hard"])
+        warnings.extend(startup["warnings"])
     for name, text in child.items():
         if not name.endswith(".py"):
             continue
@@ -211,8 +331,9 @@ def program_judge(view):
             tree = ast.parse(text, filename=name)
             checks.append({"rule": "syntax", "file": name, "passed": True})
         except SyntaxError as exc:
-            finding = {"rule": "syntax", "file": name, "line": exc.lineno, "reason": str(exc)}
-            (hard if name == entry else warnings).append(finding)
+            if not startup:
+                finding = {"rule": "syntax", "file": name, "line": exc.lineno, "reason": str(exc)}
+                (hard if name == entry else warnings).append(finding)
             continue
         before = view.get("parent_files", {}).get(name, "")
         try:
@@ -230,7 +351,7 @@ def program_judge(view):
     unchanged = view["parent_fingerprints"] == view["child_fingerprints"]
     if unchanged:
         warnings.append({"rule": "unchanged_snapshot", "reason": "The source snapshots are identical; repeated evaluation may still provide statistical evidence, so this rule does not reject the child"})
-    return {"method": "program", "version": "conservative-v1", "action": "skip" if hard else "evaluate",
+    return {"method": "program", "version": "conservative-v2", "action": "skip" if hard else "evaluate",
             "reason": "Definite startup failure" if hard else "Insufficient evidence to skip; validate through task evaluation",
             "hard_failures": hard, "checks": checks, "warnings": warnings,
             "probability": None, "elapsed_s": round(time.monotonic() - started, 6)}
@@ -278,13 +399,36 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError("model endpoint redirects are disabled")
 
 
-def qwen_judge(view, *, transport=None):
+def judge_url(node=None):
+    """Where the judge request goes.
+
+    Metering on (RSI_LEDGER set): through efficient-rsi's proxy (RSI_PROXY_URL) with tag "sift", like
+    every other model call, so the ledger gets an llm_call event and analyze_ledger.py shows the
+    judge as its own stage. The proxy forwards the body unchanged to its vLLM upstream, so the
+    logprobs come back. SIFT_BASE_URL must then be unset: it would bypass the meter.
+    Metering off (tests, demos): SIFT_BASE_URL, default the local vLLM at 127.0.0.1:8000.
+    """
+    if os.getenv("RSI_LEDGER"):
+        proxy = os.getenv("RSI_PROXY_URL")
+        if not proxy:
+            raise ValueError("RSI_LEDGER is set but RSI_PROXY_URL is not: the judge's model time would not be metered")
+        if os.getenv("SIFT_BASE_URL"):
+            raise ValueError("unset SIFT_BASE_URL when RSI_LEDGER is set: the judge goes through RSI_PROXY_URL")
+        import rsi_ledger
+        return _local_endpoint(rsi_ledger._tagged_url(proxy, "sift", node, None, provider="vllm"))
+    return _local_endpoint(os.getenv("SIFT_BASE_URL", "http://127.0.0.1:8000/v1"))
+
+
+def qwen_judge(view, *, transport=None, node=None):
     """One local request; the A/B score only orders evaluation. Qwen never skips a child."""
     started = time.monotonic()
     body = {"model": os.getenv("SIFT_MODEL", "vllm-qwen3c-local"),
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": json.dumps(judge_message(view), ensure_ascii=False)}],
-            "temperature": 0, "max_tokens": 96, "logprobs": True, "top_logprobs": 20, "stream": False}
+            "temperature": 0, "max_tokens": 96, "logprobs": True, "top_logprobs": 20, "stream": False,
+            # A model that thinks first (e.g. Qwen3.5-9B) would put its thinking token where A or B
+            # must be. Templates without the switch (Qwen3-Coder-30B-A3B-Instruct) ignore it.
+            "chat_template_kwargs": {"enable_thinking": False}}
     # Optional on vLLM versions supporting explicit token IDs; configure only after checking
     # the deployed model's tokenizer. No guessed vocabulary IDs, no constrained explanation.
     if os.getenv("SIFT_AB_TOKEN_IDS"):
@@ -298,7 +442,7 @@ def qwen_judge(view, *, transport=None):
         if transport:
             reply = transport(body)
         else:
-            url = _local_endpoint(os.getenv("SIFT_BASE_URL", "http://127.0.0.1:8000/v1"))
+            url = judge_url(node)
             headers = {"Content-Type": "application/json"}
             if os.getenv("SIFT_API_KEY"):
                 headers["Authorization"] = "Bearer " + os.environ["SIFT_API_KEY"]
@@ -320,7 +464,7 @@ def qwen_judge(view, *, transport=None):
     return result
 
 
-def evaluate(view, mode, *, transport=None):
+def evaluate(view, mode, *, transport=None, node=None):
     """The free program check runs first in every mode; only it can skip a child (with SIFT_ENFORCE=1).
     In qwen mode a child that is not skipped gets one Qwen request; with SIFT_ENFORCE=1 and a usable
     score, order_score is that score and HGM uses it to order evaluation (order_priors)."""
@@ -330,7 +474,7 @@ def evaluate(view, mode, *, transport=None):
     decisions = {"program": program_judge(view)}
     skip = enforce and decisions["program"]["action"] == "skip"
     if mode in ("qwen", "compare") and not skip:   # a child that will not run needs no Qwen request
-        decisions["qwen"] = qwen_judge(view, transport=transport)
+        decisions["qwen"] = qwen_judge(view, transport=transport, node=node)
     qwen = decisions.get("qwen", {})
     order_score = qwen["p_evaluate_ab"] if enforce and mode == "qwen" and qwen.get("status") == "scored" else None
     return {"stage": "before_child_evaluation", "mode": mode, "enforce": enforce,
@@ -350,7 +494,7 @@ def run_gate(node_dir, parent_dir, initial_path, ancestor_patches, *, agent_kind
         view = build_input(initial_path, ancestor_patches, node_dir / "model_patch.diff", parent_dir,
                            agent_kind=agent_kind, timeout_s=timeout_s)
         task_records.atomic_json(dest / "input.json", view)
-        report = evaluate(view, mode)
+        report = evaluate(view, mode, node=node_dir.name)
     except Exception as exc:
         report = {"stage": "before_child_evaluation", "mode": mode, "skip_evaluation": False,
                   "order_score": None, "status": "unavailable", "reason": str(exc)[:2000]}

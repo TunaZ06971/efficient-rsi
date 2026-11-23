@@ -310,7 +310,8 @@ def fit_prompt(system_message, prompt, limit, keep_tail=CLIP_KEEP_TAIL):
 
 
 def process_selfimprove_eval_logs(md_logs, eval_logs, predicted_patches, eval_results):
-    detailed_feedback = os.getenv("HGM_RECORD_FEEDBACK", "0") == "1"
+    # task record cards (task_records.feedback_enabled): both switches, so the wording never changes alone
+    detailed_feedback = os.getenv("HGM_TASK_RECORDS", "0") == "1" and os.getenv("HGM_RECORD_FEEDBACK", "0") == "1"
     # NOTE: using only the first logs
     md_log = md_logs[0] if md_logs else "No logs available."
     eval_log = (

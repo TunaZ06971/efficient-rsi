@@ -48,9 +48,494 @@ def process_entry(
     Process a single dataset entry. This function encapsulates the main processing logic
     for each entry to make it suitable for parallel execution.
     """
+    if task_records.enabled():       # task record cards (HGM_TASK_RECORDS=1); unset: the code below as before
+        return _process_entry_records(entry, out_dname, model_name_or_path, model_patch_paths,
+                                      skip_existing=skip_existing, init_agent_path=init_agent_path)
     if lc_integration.enabled():     # harness-rsi: little-coder agent, coupled evaluation
         return process_entry_lc(entry, out_dname, model_name_or_path, model_patch_paths,
                                 skip_existing=skip_existing, init_agent_path=init_agent_path)
+    instance_id = entry["instance_id"]
+    problem_statement = entry["problem_statement"]
+    base_commit = entry["base_commit"]
+    chat_history_file = out_dname / (instance_id + ".md")
+    out_fname = out_dname / (instance_id + ".json")
+    eval_file = out_dname / f"{instance_id}_eval.sh"
+    eval_result_file = out_dname / f"{instance_id}_eval.md"
+
+    # Skip if output result already exists
+    if out_fname.exists() and skip_existing:
+        print(f"Skipping existing entry {instance_id}")
+        with open(out_fname) as f:
+            result = json.loads(f.read())
+        return result
+
+    # Initialize container as None to avoid UnboundLocalError
+    container = None
+
+    phases = rsi_ledger.Phases("eval", node=model_name_or_path, task=instance_id)
+    phases.phase("setup")
+    try:
+        # Create and start the Docker container
+        client = docker.from_env()
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        # Set up thread-specific logger
+        logger = setup_logger(str(out_dname / f"{instance_id}_docker.log"))
+        nocache = True
+        test_spec = make_test_spec(entry)
+        # Remove any existing container with the same name
+        container_name = test_spec.get_instance_container_name(run_id)
+        remove_existing_container(client, container_name)
+        # Now create and start the container
+        container = build_container(
+            test_spec, client, run_id, logger, nocache, force_rebuild=False
+        )
+        container.start()
+        phases.attach(container)
+
+        # Copy the necessary files and requirements to the container
+        copy_to_container(
+            container,
+            os.path.join(init_agent_path, "coding_agent_polyglot.py"),
+            "/hgm/coding_agent.py",
+        )
+        copy_to_container(
+            container,
+            os.path.join(init_agent_path, "requirements.txt"),
+            "/hgm/requirements.txt",
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "pytest.ini"), "/hgm/pytest.ini"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "tools/"), "/hgm/tools/"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "utils/"), "/hgm/utils/"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "tests/"), "/hgm/tests/"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "prompts/"), "/hgm/prompts/"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "llm.py"), "/hgm/llm.py"
+        )
+        copy_to_container(
+            container,
+            os.path.join(init_agent_path, "llm_withtools.py"),
+            "/hgm/llm_withtools.py",
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "LICENSE"), "/hgm/LICENSE"
+        )
+        copy_to_container(
+            container, os.path.join(init_agent_path, "README.md"), "/hgm/README.md"
+        )
+        chat_history_file_container = f"/hgm/{chat_history_file.name}"
+
+        # See the checked repo
+        exec_result = container.exec_run("ls -R /testbed", workdir="/")
+        log_container_output(exec_result)
+
+        # Get test description
+        eval_cmd = MAP_REPO_VERSION_TO_SPECS[entry["language"]]["test_cmd"]
+        test_description = get_test_description(eval_cmd, polyglot=True)
+
+        # Apply model patch
+        if model_patch_paths:
+            safe_log("Applying model patches")
+            for model_patch_path in model_patch_paths:
+                copy_to_container(container, model_patch_path, "/hgm/parent_patch.txt")
+                exec_result = container.exec_run(
+                    "/bin/sh -c 'patch -p1 < /hgm/parent_patch.txt'", workdir="/hgm"
+                )
+                log_container_output(exec_result)
+                exec_result = container.exec_run(
+                    "rm /hgm/parent_patch.txt", workdir="/hgm"
+                )
+                log_container_output(exec_result)
+
+        # Install this repo requirements
+        safe_log("Installing more requirements")
+        exec_result = container.exec_run(
+            "python -m pip install -r /hgm/requirements.txt", workdir="/"
+        )
+        log_container_output(exec_result)
+
+        # Run the agent
+        env_vars = {
+            "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+            "AWS_REGION": os.getenv("AWS_REGION"),
+            "AWS_REGION_NAME": os.getenv("AWS_REGION_NAME"),
+            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
+            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
+            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+            "OpenRouter_API_KEY": os.getenv("OpenRouter_API_KEY"),
+        }
+        safe_log("Running the agent")
+        cmd = [
+            "timeout",
+            str(timeout),
+            "python",
+            "/hgm/coding_agent.py",
+            "--problem_statement",
+            problem_statement,
+            "--git_dir",
+            "/testbed/",
+            "--chat_history_file",
+            chat_history_file_container,
+            "--base_commit",
+            base_commit,
+            "--outdir",
+            "/hgm/",
+            "--test_description",
+            test_description,
+            "--language",
+            entry["language"],
+            "--model",
+            llm,
+            "--timeout",
+            str(timeout),
+        ]
+        env_vars.update(rsi_ledger.proxy_env("eval", model_name_or_path, instance_id))
+        phases.phase("agent_run")
+        exec_result = container.exec_run(cmd, environment=env_vars, workdir="/testbed/")
+        log_container_output(exec_result)
+
+        # Copy output files back to host
+        logger.info("Copying output files back to host")
+        copy_from_container(container, chat_history_file_container, chat_history_file)
+        # Additional chat history files
+        exec_result = container.exec_run(
+            f"find /hgm/ -name '{instance_id}_*.md'", workdir="/"
+        )
+        chat_history_files_container = exec_result.output.decode().split()
+        for chat_history_file_container in chat_history_files_container:
+            chat_history_file = out_dname / Path(chat_history_file_container).name
+            copy_from_container(
+                container, chat_history_file_container, chat_history_file
+            )
+
+        # Get model_patch
+        logger.info("Getting model_patch")
+        exec_result = container.exec_run("cat /hgm/model_patch.diff")
+        log_container_output(exec_result)
+        model_patch = ""
+        model_patch = exec_result.output.decode()
+
+        # Additional proposed model patches
+        proposed_model_patches = []
+
+        phases.phase("test")
+        # Directly do eval
+        eval_result = ""
+        if not model_patch:
+            eval_result = "empty_patch"
+            result = {
+                "instance_id": instance_id,
+                "model_name_or_path": model_name_or_path,
+                "model_patch": model_patch,
+                "proposed_model_patches": proposed_model_patches,
+                "eval_result": eval_result,
+                "success": True,
+            }
+            out_fname.write_text(json.dumps(result, indent=4))
+            return {
+                "success": True,
+                "instance_id": instance_id,
+                "eval_result": eval_result,
+            }
+
+        if hide_answers():
+            # The agent is done. Stop anything it left running, so no part of it is alive when
+            # the tests arrive, then fetch the commit with the tests from the task's repo on the
+            # host: the image no longer has it (polyglot/test_spec.py, HGM_HIDE_ANSWERS)
+            exec_result = container.exec_run("sh -c 'kill -9 -1 || true'", workdir="/")
+            log_container_output(exec_result)
+            copy_to_container(container, Path(entry["repo"]) / ".git", "/tmp/answer_repo/.git")
+            # The copy keeps the host's file owner, and git won't read a repository owned by
+            # another user unless told it is safe (a command-line -c is not enough for the
+            # repository it fetches from). The container is thrown away after grading.
+            exec_result = container.exec_run(
+                "git config --global --add safe.directory '*'", workdir="/"
+            )
+            log_container_output(exec_result)
+            exec_result = container.exec_run(
+                "git -C /testbed fetch --quiet /tmp/answer_repo HEAD", workdir="/"
+            )
+            log_container_output(exec_result)
+
+        exec_result = container.exec_run(
+            "git -C /testbed stash push " + " ".join(entry["files"]["solution"]),
+            workdir="/",
+        )
+        log_container_output(exec_result)
+        exec_result = container.exec_run(
+            f"git -C /testbed reset --hard {entry['test_commit']}", workdir="/"
+        )
+        log_container_output(exec_result)
+        exec_result = container.exec_run(f"git -C /testbed clean -fd", workdir="/")
+        log_container_output(exec_result)
+        exec_result = container.exec_run("git -C /testbed stash pop", workdir="/")
+        log_container_output(exec_result)
+
+        safe_log("Running the eval")
+        language = entry["language"]
+        test_command = TEST_COMMANDS[language]
+
+        eval_file.write_text(get_eval_script(test_command))
+
+        copy_to_container(container, eval_file, "/testbed/eval.sh")
+        exec_result = container.exec_run("ls -R /testbed", workdir="/")
+        log_container_output(exec_result)
+        exec_result = container.exec_run("chmod +x /testbed/eval.sh", workdir="/")
+        log_container_output(exec_result)
+
+        exec_result = container.exec_run("timeout 120 ./eval.sh", workdir="/testbed")
+        log_container_output(exec_result, raise_error=False)
+        eval_result_file.write_text(exec_result.output.decode())
+        if exec_result.exit_code == 0:
+            eval_result = "resolved"
+        else:
+            eval_result = "unresolved"
+
+        # Write result to file
+        result = {
+            "instance_id": instance_id,
+            "model_name_or_path": model_name_or_path,
+            "model_patch": model_patch,
+            "proposed_model_patches": proposed_model_patches,
+            "eval_result": eval_result,
+            "success": True,
+        }
+        out_fname.write_text(json.dumps(result, indent=4))
+
+        return {"success": True, "instance_id": instance_id, "eval_result": eval_result}
+
+    except Exception as e:
+        # Check if eval_result exists in local scope
+        if "eval_result" not in locals():
+            eval_result = "incomplete"
+        else:
+            eval_result = "error"
+        if "model_patch" not in locals():
+            model_patch = ""
+        if "proposed_model_patches" not in locals():
+            proposed_model_patches = ""
+
+        # Write result to file
+        result = {
+            "instance_id": instance_id,
+            "model_name_or_path": model_name_or_path,
+            "model_patch": model_patch,
+            "proposed_model_patches": proposed_model_patches,
+            "eval_result": eval_result,
+            "success": False,
+        }
+        out_fname.write_text(json.dumps(result, indent=4))
+
+        # print(f"Error processing entry {instance_id}: {str(e)}")
+        logger.error(f"Error processing entry {instance_id}: {str(e)}")
+        return {
+            "success": False,
+            "instance_id": instance_id,
+            "eval_result": eval_result,
+        }
+
+    finally:
+        phases.done()
+        # Clean up docker container
+        try:
+            if container is not None:
+                cleanup_container(client, container, logger)
+        except Exception as e:
+            print(f"Error cleaning up Docker container for {instance_id}: {e}")
+
+
+def _score_in_container(container, entry, eval_file):
+    """efficient-rsi's grading, unchanged: stop the agent's processes, bring in the test commit,
+    keep only the solution files, run the language's test command (polyglot/harness.py)."""
+    if hide_answers():
+        container.exec_run("sh -c 'kill -9 -1 || true'", workdir="/")
+        copy_to_container(container, Path(entry["repo"]) / ".git", "/tmp/answer_repo/.git")
+        container.exec_run("git config --global --add safe.directory '*'", workdir="/")
+        log_container_output(container.exec_run("git -C /testbed fetch --quiet /tmp/answer_repo HEAD", workdir="/"))
+    log_container_output(container.exec_run(
+        "git -C /testbed stash push " + " ".join(entry["files"]["solution"]), workdir="/"))
+    log_container_output(container.exec_run(f"git -C /testbed reset --hard {entry['test_commit']}", workdir="/"))
+    log_container_output(container.exec_run("git -C /testbed clean -fd", workdir="/"))
+    log_container_output(container.exec_run("git -C /testbed stash pop", workdir="/"))
+    eval_file.write_text(get_eval_script(TEST_COMMANDS[entry["language"]]))
+    copy_to_container(container, eval_file, "/testbed/eval.sh")
+    container.exec_run("chmod +x /testbed/eval.sh", workdir="/")
+    return container.exec_run("timeout 120 ./eval.sh", workdir="/testbed")
+
+
+def process_entry_lc(entry, out_dname, model_name_or_path, model_patch_paths,
+                     skip_existing=True, init_agent_path="."):
+    """harness-rsi (lc_integration.py): one evaluation of the little-coder agent on one task.
+
+    Differences from process_entry:
+      - the agent is <init_agent_path>/lc, patched in /hgm/lc, run as /hgm/lc/hgm_agent.py;
+      - HGM_TEST_PROTOCOL=visible_ro: the task's tests are copied into /testbed before the agent
+        runs, read-only, and hashed before and after; a changed hash scores the attempt unresolved;
+      - the agent records every model call; with HGM_COUPLED=1 and a parent record of this task it
+        replays the parent's trajectory and calls the model only from the divergence point on;
+      - web tools are off (LC_DISABLE_TOOLS); the records go to <node>/records/, the attempt
+        summary to <task>_rsi.json, and an lc_eval event (route, live model seconds) to the ledger.
+    Grading is efficient-rsi's (_score_in_container)."""
+    instance_id = entry["instance_id"]
+    chat_history_file = out_dname / (instance_id + ".md")
+    out_fname = out_dname / (instance_id + ".json")
+    eval_file = out_dname / f"{instance_id}_eval.sh"
+    eval_result_file = out_dname / f"{instance_id}_eval.md"
+    attempt_file = out_dname / f"{instance_id}_rsi.json"
+    if out_fname.exists() and skip_existing:
+        return json.loads(out_fname.read_text())
+
+    node = model_name_or_path[:-2] if model_name_or_path.endswith("_0") else model_name_or_path
+    node_dir = lc_integration.node_dir_from_outdir(out_dname)
+    pdir = lc_integration.parent_dir(node_dir)
+    replay = lc_integration.coupled() and pdir is not None and lc_integration.has_record(pdir, instance_id)
+    rec_host = lc_integration.record_prefix(node_dir, instance_id)
+    rec_host.parent.mkdir(parents=True, exist_ok=True)
+
+    container, client, logger = None, None, None
+    eval_result, model_patch, attempt, tests_modified = "incomplete", "", {}, False
+    phases = rsi_ledger.Phases("eval", node=model_name_or_path, task=instance_id)
+    phases.phase("setup")
+    try:
+        client = docker.from_env()
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        logger = setup_logger(str(out_dname / f"{instance_id}_docker.log"))
+        test_spec = make_test_spec(entry)
+        container_name = test_spec.get_instance_container_name(run_id)
+        remove_existing_container(client, container_name)
+        container = build_container(test_spec, client, run_id, logger, True, force_rebuild=False)
+        container.start()
+        phases.attach(container)
+
+        copy_to_container(container, os.path.join(init_agent_path, lc_integration.LC_DIR) + "/",
+                          lc_integration.CONTAINER_LC + "/")
+        for model_patch_path in model_patch_paths or []:
+            copy_to_container(container, model_patch_path, "/hgm/parent_patch.txt")
+            log_container_output(container.exec_run(
+                "/bin/sh -c 'patch -p1 < /hgm/parent_patch.txt'", workdir=lc_integration.CONTAINER_LC))
+            container.exec_run("rm /hgm/parent_patch.txt", workdir="/hgm")
+        log_container_output(container.exec_run(
+            f"python -m pip install -r {lc_integration.CONTAINER_LC}/requirements.txt", workdir="/"))
+
+        protected, hashes_before = [], {}
+        if lc_integration.protocol() == "visible_ro":
+            for rel, data in lc_integration.test_file_contents(entry).items():
+                container.exec_run(["mkdir", "-p", str(Path(f"/testbed/{rel}").parent)], workdir="/")
+                with tempfile.NamedTemporaryFile(delete=False) as tf:
+                    tf.write(data)
+                copy_to_container(container, Path(tf.name), f"/testbed/{rel}")
+                os.unlink(tf.name)
+                container.exec_run(["chmod", "444", f"/testbed/{rel}"], workdir="/")
+                protected.append(rel)
+            hashes_before = lc_integration.sha256_map(container, protected)
+
+        if replay:
+            container.exec_run(["mkdir", "-p", "/hgm/parent_record"], workdir="/")
+            for suffix in (".jsonl", ".req.jsonl.gz"):
+                copy_to_container(container, Path(str(lc_integration.record_prefix(pdir, instance_id)) + suffix),
+                                  "/hgm/parent_record/rec" + suffix)
+
+        eval_cmd = MAP_REPO_VERSION_TO_SPECS[entry["language"]]["test_cmd"]
+        env_vars = {
+            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+            "HGM_TASK_ID": instance_id,
+            "HGM_PROTECTED_FILES": ",".join(protected),
+            "LC_DISABLE_TOOLS": "WebSearch,WebFetch",
+            "LC_FIXED_DATE": os.getenv("LC_FIXED_DATE", ""),
+            "LC_RSI_MODE": "replay" if replay else "record",
+            "LC_RECORD_TO": "/hgm/record/rec",
+            "LC_REPLAY_FROM": "/hgm/parent_record/rec" if replay else "",
+            "LC_ON_DIVERGE": "live",
+        }
+        env_vars.update(rsi_ledger.proxy_env("eval", model_name_or_path, instance_id))
+        cmd = ["timeout", str(timeout), "python", f"{lc_integration.CONTAINER_LC}/hgm_agent.py",
+               "--problem_statement", entry["problem_statement"], "--git_dir", "/testbed/",
+               "--chat_history_file", f"/hgm/{chat_history_file.name}", "--base_commit", entry["base_commit"],
+               "--outdir", "/hgm/", "--test_description", get_test_description(eval_cmd, polyglot=True),
+               "--language", entry["language"], "--model", llm, "--timeout", str(timeout)]
+        phases.phase("agent_run")
+        log_container_output(container.exec_run(cmd, environment=env_vars, workdir="/testbed/"))
+
+        copy_from_container(container, f"/hgm/{chat_history_file.name}", chat_history_file)
+        copy_from_container(container, "/hgm/rsi_attempt.json", attempt_file)
+        for suffix in (".jsonl", ".req.jsonl.gz", ".replay", ".replay.req.jsonl.gz", ".side.jsonl"):
+            try:
+                copy_from_container(container, "/hgm/record/rec" + suffix, Path(str(rec_host) + suffix))
+            except Exception:
+                pass                      # optional files (no side calls, no replay log)
+        try:
+            attempt = json.loads(attempt_file.read_text())
+        except Exception:
+            attempt = {}
+        model_patch = container.exec_run("cat /hgm/model_patch.diff").output.decode()
+        if protected:
+            tests_modified = lc_integration.sha256_map(container, protected) != hashes_before
+            # the visible copies are untracked; grading checks out the real tests from test_commit
+            container.exec_run(["rm", "-f"] + [f"/testbed/{rel}" for rel in protected], workdir="/")
+
+        phases.phase("test")
+        if not model_patch:
+            eval_result = "empty_patch"
+        else:
+            r = _score_in_container(container, entry, eval_file)
+            eval_result_file.write_text(r.output.decode())
+            eval_result = "resolved" if r.exit_code == 0 and not tests_modified else "unresolved"
+        success = True
+    except Exception as e:
+        if logger is not None:
+            logger.error(f"Error processing entry {instance_id}: {e}")
+        eval_result = "incomplete" if not model_patch else "error"
+        success = False
+    finally:
+        phases.done()
+        try:
+            if container is not None:
+                cleanup_container(client, container, logger)
+        except Exception as e:
+            print(f"Error cleaning up Docker container for {instance_id}: {e}")
+
+    route = lc_integration.attempt_route(attempt, replay)
+    cost = lc_integration.record_cost(rec_host)
+    lc_integration.ledger_event(rsi_ledger, node, instance_id, route, attempt, cost, tests_modified, eval_result)
+    result = {"instance_id": instance_id, "model_name_or_path": model_name_or_path,
+              "model_patch": model_patch, "proposed_model_patches": [], "eval_result": eval_result,
+              "success": success, "tests_modified": tests_modified, "lc_route": route,
+              "lc_parent": pdir.name if pdir is not None else None, "lc_cost": cost}
+    out_fname.write_text(json.dumps(result, indent=4))
+    return {"success": success, "instance_id": instance_id, "eval_result": eval_result}
+
+
+# ---------------------------------------------------------------- task record cards ----------
+# Used only with HGM_TASK_RECORDS=1 (task_records.py, SIFT_AND_RECORDS.md).
+
+def _process_entry_records(
+    entry,
+    out_dname,
+    model_name_or_path,
+    model_patch_paths,
+    skip_existing=True,
+    init_agent_path=".",
+):
+    """process_entry with a task record card (HGM_TASK_RECORDS=1, task_records.py).
+
+    The steps and the grading are process_entry's: the grading block below is a copy of it, and
+    card.patch_for_grading() raises in every case where process_entry records "incomplete"
+    (agent exit code not 0; chat log or patch not readable). The card adds evidence only: why the
+    attempt stopped, the answer left behind (graded only with HGM_RECOVER_ANSWERS=1), test counts,
+    time per stage.
+    """
+    if lc_integration.enabled():     # harness-rsi: little-coder agent, coupled evaluation
+        return _process_entry_lc_records(entry, out_dname, model_name_or_path, model_patch_paths,
+                                         skip_existing=skip_existing, init_agent_path=init_agent_path)
     instance_id = entry["instance_id"]
     problem_statement = entry["problem_statement"]
     base_commit = entry["base_commit"]
@@ -232,9 +717,55 @@ def process_entry(
             }
 
         card.phase("grade")
-        exec_result = _score_in_container(container, entry, eval_file)
+        # efficient-rsi's grading, the same lines as in process_entry
+        if hide_answers():
+            # The agent is done. Stop anything it left running, so no part of it is alive when
+            # the tests arrive, then fetch the commit with the tests from the task's repo on the
+            # host: the image no longer has it (polyglot/test_spec.py, HGM_HIDE_ANSWERS)
+            exec_result = container.exec_run("sh -c 'kill -9 -1 || true'", workdir="/")
+            log_container_output(exec_result)
+            copy_to_container(container, Path(entry["repo"]) / ".git", "/tmp/answer_repo/.git")
+            # The copy keeps the host's file owner, and git won't read a repository owned by
+            # another user unless told it is safe (a command-line -c is not enough for the
+            # repository it fetches from). The container is thrown away after grading.
+            exec_result = container.exec_run(
+                "git config --global --add safe.directory '*'", workdir="/"
+            )
+            log_container_output(exec_result)
+            exec_result = container.exec_run(
+                "git -C /testbed fetch --quiet /tmp/answer_repo HEAD", workdir="/"
+            )
+            log_container_output(exec_result)
+
+        exec_result = container.exec_run(
+            "git -C /testbed stash push " + " ".join(entry["files"]["solution"]),
+            workdir="/",
+        )
+        log_container_output(exec_result)
+        exec_result = container.exec_run(
+            f"git -C /testbed reset --hard {entry['test_commit']}", workdir="/"
+        )
+        log_container_output(exec_result)
+        exec_result = container.exec_run(f"git -C /testbed clean -fd", workdir="/")
+        log_container_output(exec_result)
+        exec_result = container.exec_run("git -C /testbed stash pop", workdir="/")
+        log_container_output(exec_result)
+
+        safe_log("Running the eval")
+        language = entry["language"]
+        test_command = TEST_COMMANDS[language]
+
+        eval_file.write_text(get_eval_script(test_command))
+
+        copy_to_container(container, eval_file, "/testbed/eval.sh")
+        exec_result = container.exec_run("ls -R /testbed", workdir="/")
+        log_container_output(exec_result)
+        exec_result = container.exec_run("chmod +x /testbed/eval.sh", workdir="/")
+        log_container_output(exec_result)
+
+        exec_result = container.exec_run("timeout 120 ./eval.sh", workdir="/testbed")
         log_container_output(exec_result, raise_error=False)
-        eval_result_file.write_text(exec_result.output.decode(errors="replace"))
+        eval_result_file.write_text(exec_result.output.decode())
         card.grade(exec_result)
         if exec_result.exit_code == 0:
             eval_result = "resolved"
@@ -297,60 +828,15 @@ def process_entry(
             print(f"Error cleaning up Docker container for {instance_id}: {e}")
 
 
-def _publish_task_artifacts(card, out_dir, record_prefix=None):
-    """Keep legacy readers working; the attempt directory retains the original evidence."""
-    for name, legacy in (("trajectory.md", f"{card.task}.md"), ("agent_attempt.json", f"{card.task}_rsi.json")):
-        source = card.dir / name
-        if source.exists():
-            shutil.copy2(source, Path(out_dir) / legacy)
-    for source in card.data["evidence"].get("additional_trace_paths", []):
-        shutil.copy2(source, Path(out_dir) / Path(source).name)
-    # Only completed attempts supply replay caches; incomplete records stay in the card directory.
-    if record_prefix is not None and card.data["execution"]["exit_code"] == 0:
-        for suffix in (".jsonl", ".req.jsonl.gz", ".replay", ".replay.req.jsonl.gz", ".side.jsonl"):
-            source = card.dir / ("record" + suffix)
-            if source.exists():
-                shutil.copy2(source, Path(str(record_prefix) + suffix))
+def _process_entry_lc_records(entry, out_dname, model_name_or_path, model_patch_paths,
+                              skip_existing=True, init_agent_path="."):
+    """process_entry_lc with a task record card (HGM_TASK_RECORDS=1, task_records.py).
 
+    Same steps and grading as process_entry_lc; the card adds evidence. In the container,
+    HGM_TASK_RECORDS=1 also makes lc/hgm_agent.py exit with main()'s code instead of always 0, so
+    a startup failure shows as one. What follows is process_entry_lc's description.
 
-def _finish_task_record(card, container, result, out_dir):
-    try:
-        if not card.collected and card.data["execution"].get("stage") == "solve":
-            card.collect(container, copy_from_container)
-            _publish_task_artifacts(card, out_dir)
-        docker_log = Path(out_dir) / f"{card.task}_docker.log"
-        if docker_log.exists():
-            shutil.copy2(docker_log, card.dir / "runner.log")
-            card.data["evidence"]["runner_log_path"] = str(card.dir / "runner.log")
-        card.finish(result)
-    except Exception as exc:
-        # Logging failure must not turn an original timeout into a different execution outcome.
-        safe_log(f"Task record could not be finalized ({card.id}): {exc}")
-
-
-def _score_in_container(container, entry, eval_file):
-    """efficient-rsi's grading, unchanged: stop the agent's processes, bring in the test commit,
-    keep only the solution files, run the language's test command (polyglot/harness.py)."""
-    if hide_answers():
-        container.exec_run("sh -c 'kill -9 -1 || true'", workdir="/")
-        copy_to_container(container, Path(entry["repo"]) / ".git", "/tmp/answer_repo/.git")
-        container.exec_run("git config --global --add safe.directory '*'", workdir="/")
-        log_container_output(container.exec_run("git -C /testbed fetch --quiet /tmp/answer_repo HEAD", workdir="/"))
-    log_container_output(container.exec_run(
-        ["git", "--literal-pathspecs", "-C", "/testbed", "stash", "push", "--include-untracked", "--",
-         *entry["files"]["solution"]], workdir="/"))
-    log_container_output(container.exec_run(f"git -C /testbed reset --hard {entry['test_commit']}", workdir="/"))
-    log_container_output(container.exec_run("git -C /testbed clean -fd", workdir="/"))
-    log_container_output(container.exec_run("git -C /testbed stash pop", workdir="/"))
-    eval_file.write_text(get_eval_script(TEST_COMMANDS[entry["language"]]))
-    copy_to_container(container, eval_file, "/testbed/eval.sh")
-    container.exec_run("chmod +x /testbed/eval.sh", workdir="/")
-    return container.exec_run("timeout 120 ./eval.sh", workdir="/testbed")
-
-
-def process_entry_lc(entry, out_dname, model_name_or_path, model_patch_paths,
-                     skip_existing=True, init_agent_path="."):
-    """harness-rsi (lc_integration.py): one evaluation of the little-coder agent on one task.
+    harness-rsi (lc_integration.py): one evaluation of the little-coder agent on one task.
 
     Differences from process_entry:
       - the agent is <init_agent_path>/lc, patched in /hgm/lc, run as /hgm/lc/hgm_agent.py;
@@ -433,6 +919,7 @@ def process_entry_lc(entry, out_dname, model_name_or_path, model_patch_paths,
             "LC_RECORD_TO": "/hgm/record/rec",
             "LC_REPLAY_FROM": "/hgm/parent_record/rec" if replay else "",
             "LC_ON_DIVERGE": "live",
+            "HGM_TASK_RECORDS": "1",
         }
         env_vars.update(rsi_ledger.proxy_env("eval", model_name_or_path, instance_id))
         cmd = ["timeout", str(timeout), "python", f"{lc_integration.CONTAINER_LC}/hgm_agent.py",
@@ -490,6 +977,37 @@ def process_entry_lc(entry, out_dname, model_name_or_path, model_patch_paths,
               "task_record": str(card.path.relative_to(out_dname)), "attempt_id": card.id}
     out_fname.write_text(json.dumps(result, indent=4))
     return {"success": success, "instance_id": instance_id, "eval_result": eval_result}
+
+
+def _publish_task_artifacts(card, out_dir, record_prefix=None):
+    """Keep legacy readers working; the attempt directory retains the original evidence."""
+    for name, legacy in (("trajectory.md", f"{card.task}.md"), ("agent_attempt.json", f"{card.task}_rsi.json")):
+        source = card.dir / name
+        if source.exists():
+            shutil.copy2(source, Path(out_dir) / legacy)
+    for source in card.data["evidence"].get("additional_trace_paths", []):
+        shutil.copy2(source, Path(out_dir) / Path(source).name)
+    # Only completed attempts supply replay caches; incomplete records stay in the card directory.
+    if record_prefix is not None and card.data["execution"]["exit_code"] == 0:
+        for suffix in (".jsonl", ".req.jsonl.gz", ".replay", ".replay.req.jsonl.gz", ".side.jsonl"):
+            source = card.dir / ("record" + suffix)
+            if source.exists():
+                shutil.copy2(source, Path(str(record_prefix) + suffix))
+
+
+def _finish_task_record(card, container, result, out_dir):
+    try:
+        if not card.collected and card.data["execution"].get("stage") == "solve":
+            card.collect(container, copy_from_container)
+            _publish_task_artifacts(card, out_dir)
+        docker_log = Path(out_dir) / f"{card.task}_docker.log"
+        if docker_log.exists():
+            shutil.copy2(docker_log, card.dir / "runner.log")
+            card.data["evidence"]["runner_log_path"] = str(card.dir / "runner.log")
+        card.finish(result)
+    except Exception as exc:
+        # Logging failure must not turn an original timeout into a different execution outcome.
+        safe_log(f"Task record could not be finalized ({card.id}): {exc}")
 
 
 def _harness(

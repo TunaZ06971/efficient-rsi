@@ -35,3 +35,26 @@ the code still runs as upstream HGM by default, except for the `tree.py` fix (se
 | `config_local.yaml` | Configuration for one local Qwen3-Coder-30B-A3B model in every role. |
 | `rsi_ledger.py` | Link to `../../instrumentation/rsi_ledger.py`, the cost-ledger hooks. |
 | `MODIFICATIONS.md`, `EFFICIENT_RSI_CHANGES.patch` | This notice and the diff. |
+
+## Later changes to shared files (PR #3 harness-rsi, PR #4 task records and SIFT)
+
+Both PRs are off by default. With their switches unset, every file below behaves as before them,
+apart from the additions listed in the last column (code paths that never run, extra keys).
+
+| File | PR | Change | Switch | With the switch unset |
+| --- | --- | --- | --- | --- |
+| `hgm.py` | #3 | With coupled tasks, a child is evaluated first on tasks its parent has a record of. | `HGM_AGENT=littlecoder`, `HGM_COUPLED_TASKS=1` | as before |
+| `hgm.py` | #4 | Startup checks of the switches (`sift.validate_startup`); the SIFT gate after a child is proposed; Qwen's score ranks children in Thompson sampling as `SIFT_ORDER_WEIGHT` imaginary tasks. | `SIFT_MODE`, `SIFT_ENFORCE=1` | as before: the gate returns at once, every prior is (0, 0) |
+| `dgm_search.py` | #4 | The same startup checks and SIFT gate (no ordering). | `SIFT_MODE` | as before |
+| `hgm_utils.py` | #3 | `sample_child_lc`: little-coder proposes changes to its own harness (`lc_integration.py`). | `HGM_AGENT=littlecoder` | as before |
+| `hgm_utils.py` | #4 | `sift_child` (the SIFT gate); `choose_entry` can pick the focus task by failure class from the task records. | `SIFT_MODE`; `HGM_TASK_RECORDS=1` + `HGM_RECORD_FEEDBACK=1` | as before |
+| `polyglot/harness.py` | #3 | `process_entry_lc`: one evaluation of little-coder, with visible read-only tests and coupled replay. | `HGM_AGENT=littlecoder` | as before |
+| `polyglot/harness.py` | #4 | `_process_entry_records`, `_process_entry_lc_records`: the same evaluations with a task record card (`task_records.py`). Their grading lines are copied from `process_entry` / `process_entry_lc`, and they record "incomplete" in the same cases. | `HGM_TASK_RECORDS=1` | `process_entry` and `process_entry_lc` are the code from before PR #4, with one dispatch line added; `_score_in_container` is unchanged |
+| `self_improve_step.py`, `prompts/self_improvement_prompt.py` | #4 | The diagnose prompt starts with a summary of the task records, and its wording for missing results says "not collected" instead of "assume failed". | `HGM_TASK_RECORDS=1` + `HGM_RECORD_FEEDBACK=1` | as before |
+| `utils/evo_utils.py` | #4 | `metadata.json` gets two more lists, `total_incomplete_ids` and `total_error_ids`. | none | extra keys only; nothing reads them unless `HGM_RECORD_FEEDBACK=1` |
+| `lc_integration.py` | #4 | A record cut short by a timeout or crash is not replayed; the proposer workspace gets the task records and the card's failure class. | `HGM_TASK_RECORDS=1` (+ `HGM_RECORD_FEEDBACK=1` for the workspace) | as in PR #3 |
+| `lc/hgm_agent.py` | #4 | `rsi_attempt.json` also reports why the attempt stopped (`stop_reason`, `max_turns`); with records on, the process exits with `main()`'s code instead of always 0. | `HGM_TASK_RECORDS=1` for the exit code | always exits 0 as in PR #3; three extra keys in `rsi_attempt.json` |
+| `.dockerignore` | #3, #4 | Keeps the host-side files out of agent containers: `lc_integration.py`, `config_local_lc.yaml`, `scripts/`, `HARNESS_RSI.md` (#3); `sift.py`, `task_records.py`, `SIFT_AND_RECORDS.md` (#4). The section labels, which were `<!-- -->` lines (patterns that match nothing), are now `#` comments. | none | agent containers hold the same files as at PR #3; PR #3 added `lc/` and `config_local_lc_qwen35.yaml` to them |
+
+Added files: `lc/`, `lc_integration.py`, `HARNESS_RSI.md`, `config_local_lc*.yaml`, `scripts/lc_smoke.py`,
+`scripts/vendor_littlecoder.sh` (PR #3); `task_records.py`, `sift.py`, `SIFT_AND_RECORDS.md` (PR #4).

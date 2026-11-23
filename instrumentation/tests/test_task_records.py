@@ -48,6 +48,10 @@ class FakeContainer:
 
     def exec_run(self, cmd, **kwargs):
         self.commands.append(cmd)
+        if cmd == "cat /hgm/model_patch.diff":
+            if "/hgm/model_patch.diff" in self.files:
+                return result(0, self.files["/hgm/model_patch.diff"])
+            return result(1, "cat: /hgm/model_patch.diff: No such file or directory")
         if isinstance(cmd, list) and cmd[:2] == ["timeout", "30"]:
             return result(0, "recovered answer\n")
         if isinstance(cmd, list) and cmd[:2] == ["timeout", "3600"]:
@@ -71,7 +75,7 @@ class RecordsCase(unittest.TestCase):
         self.out.mkdir(parents=True)
         self.entry = dict(instance_id="python__x", problem_statement="example", base_commit="HEAD",
                           test_commit="HEAD", language="python", files={"solution": ["solution.py"]})
-        self.env = patch.dict(os.environ, {"HGM_RECOVER_ANSWERS": "0", "HGM_RECORD_FEEDBACK": "0",
+        self.env = patch.dict(os.environ, {"HGM_TASK_RECORDS": "1", "HGM_RECOVER_ANSWERS": "0", "HGM_RECORD_FEEDBACK": "0",
                                           "HGM_AGENT": "", "HGM_TEST_PROTOCOL": "hidden", "RSI_LEDGER": ""})
         self.env.start()
 
@@ -209,7 +213,7 @@ class RecordsCase(unittest.TestCase):
         self.assertEqual(T.failure_class(setup.data), "setup_error")
         self.assertEqual(setup.data["grading"]["status"], "not_run")
 
-    def harness(self, container):
+    def harness(self, container, source=None):
         class Phases:
             def __init__(self, *a, **k): pass
             def phase(self, *a, **k): pass
@@ -229,8 +233,9 @@ class RecordsCase(unittest.TestCase):
         def log(r, raise_error=True):
             if raise_error and r.exit_code: raise RuntimeError(f"exit {r.exit_code}")
         ns["log_container_output"] = log
-        tree = ast.parse((HGM / "polyglot/harness.py").read_text())
-        wanted = {"process_entry", "process_entry_lc", "_score_in_container", "get_eval_script", "_publish_task_artifacts", "_finish_task_record"}
+        tree = ast.parse(source if source is not None else (HGM / "polyglot/harness.py").read_text())
+        wanted = {"process_entry", "process_entry_lc", "_score_in_container", "get_eval_script", "_publish_task_artifacts",
+                  "_finish_task_record", "_process_entry_records", "_process_entry_lc_records"}
         exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted], type_ignores=[]), "harness.py", "exec"), ns)
         return ns
 
@@ -249,6 +254,119 @@ class RecordsCase(unittest.TestCase):
                     if code == 124:
                         self.assertEqual(card["execution"]["stop_reason"], "hard_timeout")
                     self.assertEqual(card["grading"]["status"], "passed" if code == 0 or recover == "1" else "not_run")
+
+    def test_symlink_from_container_is_refused(self):
+        c = self.card()
+        def link_copier(container, src, dest):
+            os.symlink("/etc/hosts", dest)          # what Docker's tar export restores for a link
+        self.assertIsNone(c._copy(FakeContainer(), "/hgm/python__x.md", "trajectory.md", link_copier, required=True))
+        self.assertFalse((c.dir / "trajectory.md").is_symlink())
+        self.assertIn("symbolic link", c.data["data_quality"]["collection_errors"][0]["error"])
+
+    def test_graded_pass_is_resolved_whatever_stopped_the_agent(self):
+        c = self.card("littlecoder")
+        c.data["execution"]["stop_reason"] = "turn_limit"
+        c.data["grading"]["status"] = "passed"
+        self.assertEqual(T.failure_class(c.data), "resolved")
+
+    def test_opt_ins_need_the_record_switch(self):
+        for name in ("HGM_RECORD_FEEDBACK", "HGM_RECOVER_ANSWERS"):
+            with self.subTest(name=name), patch.dict(os.environ, {"HGM_TASK_RECORDS": "0", name: "1"}):
+                self.assertFalse(T.feedback_enabled() or T.recovery_enabled())
+                with self.assertRaises(ValueError):
+                    T.validate_switches()
+
+
+MAIN = "94f0b19"   # efficient-rsi main before this change (PR #3 merged)
+DISPATCH = (
+    "    if task_records.enabled():       # task record cards (HGM_TASK_RECORDS=1); unset: the code below as before\n"
+    "        return _process_entry_records(entry, out_dname, model_name_or_path, model_patch_paths,\n"
+    "                                      skip_existing=skip_existing, init_agent_path=init_agent_path)\n")
+
+
+def main_source(path):
+    """A file as it is on MAIN, or None when git history is not available (shallow copy)."""
+    r = subprocess.run(["git", "show", f"{MAIN}:{path}"], cwd=HGM, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+class SameAsMainCase(RecordsCase):
+    """HGM_TASK_RECORDS unset: the evaluation is efficient-rsi's code. Set: the same scores."""
+
+    # (name, FakeContainer arguments, files to drop (None) or replace)
+    SCENARIOS = [
+        ("resolved", dict(), {}),
+        ("unresolved", dict(grade_code=1, grade_text="1 failed in 0.1s"), {}),
+        ("hard timeout", dict(agent_code=124), {}),
+        ("crash", dict(agent_code=1), {}),
+        ("empty patch", dict(), {"/hgm/model_patch.diff": ""}),
+        ("no patch file", dict(missing_patch=True), {}),
+        ("no chat log", dict(), {"/hgm/python__x.md": None}),
+        ("no rsi_attempt.json", dict(), {"/hgm/rsi_attempt.json": None}),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.main = main_source("repos/HGM/polyglot/harness.py")
+        if self.main is None:
+            self.skipTest(f"git history with {MAIN} is not available")
+        self.runs = 0
+
+    def run_once(self, source, kind, args, files):
+        container = FakeContainer(**args)
+        for name, text in files.items():
+            if text is None:
+                container.files.pop(name, None)
+            else:
+                container.files[name] = text
+        self.runs += 1
+        out = self.root / f"run{self.runs}" / "node/predictions/node_0"
+        out.mkdir(parents=True)
+        ns = self.harness(container, source)
+        with patch.dict(os.environ, {"HGM_AGENT": kind}):
+            ns["process_entry"](self.entry, out, "node_0", [], skip_existing=False, init_agent_path=str(HGM))
+        saved = json.loads((out / "python__x.json").read_text())
+        commands = [tuple(c) if isinstance(c, list) else c for c in container.commands]
+        return saved, commands, (out / "task_records").exists()
+
+    def test_switch_off_is_mains_code(self):
+        def functions(text):
+            tree = ast.parse(text)
+            return {n.name: ast.get_source_segment(text, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+        new, old = functions((HGM / "polyglot/harness.py").read_text()), functions(self.main)
+        self.assertIn(DISPATCH, new["process_entry"])
+        self.assertEqual(new["process_entry"].replace(DISPATCH, ""), old["process_entry"])
+        for name in old:
+            if name != "process_entry":
+                self.assertEqual(new[name], old[name], name)
+
+    def test_switch_off_same_commands_and_results(self):
+        for kind in ("original", "littlecoder"):
+            for name, args, files in self.SCENARIOS:
+                with self.subTest(kind=kind, scenario=name), patch.dict(os.environ, {"HGM_TASK_RECORDS": "0"}):
+                    old = self.run_once(self.main, kind, args, files)
+                    new = self.run_once(None, kind, args, files)
+                    self.assertEqual(new, old)
+                    self.assertFalse(new[2], "no task_records folder when the switch is off")
+
+    def test_switch_on_scores_like_main(self):
+        for kind in ("original", "littlecoder"):
+            for name, args, files in self.SCENARIOS:
+                with self.subTest(kind=kind, scenario=name):
+                    with patch.dict(os.environ, {"HGM_TASK_RECORDS": "0"}):
+                        old, _, _ = self.run_once(self.main, kind, args, files)
+                    with patch.dict(os.environ, {"HGM_TASK_RECORDS": "1"}):
+                        new, _, has_cards = self.run_once(None, kind, args, files)
+                    self.assertTrue(has_cards)
+                    if kind == "littlecoder" and name == "no patch file":
+                        # The one difference: main's process_entry_lc ignores cat's exit code and grades
+                        # cat's error message as the patch; with records the attempt is "incomplete".
+                        # Real attempts cannot reach it: hgm_agent.py writes the patch before rsi_attempt.json.
+                        self.assertEqual(new["eval_result"], "incomplete")
+                        self.assertIn(old["eval_result"], ("resolved", "unresolved"))
+                        continue
+                    self.assertEqual(new["eval_result"], old["eval_result"])
+                    self.assertEqual(new["model_patch"], old["model_patch"])
 
 
 if __name__ == "__main__":

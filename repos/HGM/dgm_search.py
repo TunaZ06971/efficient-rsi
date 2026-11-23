@@ -95,7 +95,7 @@ def create_and_evaluate(parent, image_name, src_path, small, medium, max_workers
 
 def run(output_dir, src_path, image_name, max_task_evals, polyglot, n_parallel=None, max_workers=10, logger=None,
         max_hours=None):
-    hgm_utils.sift.validate_search_budget(max_hours)
+    hgm_utils.sift.validate_startup(max_hours)
     bench = "polyglot" if polyglot else "swe_bench"
     small = load_json_file(f"./{bench}/subsets/small.json")
     medium = load_json_file(f"./{bench}/subsets/medium.json")

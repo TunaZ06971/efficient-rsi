@@ -112,7 +112,8 @@ def record_prefix(node_dir, task):
 
 
 def has_record(node_dir, task):
-    for result_path in (Path(node_dir) / "predictions").glob(f"*/{task}.json"):
+    # Task record cards (HGM_TASK_RECORDS=1): a record cut short by a timeout or crash is not replayed.
+    for result_path in (Path(node_dir) / "predictions").glob(f"*/{task}.json") if task_records.enabled() else []:
         result = task_records.read_json(result_path) or {}
         card = task_records.load_card(result, result_path.parent)
         if card and card.get("execution", {}).get("exit_code") != 0:
@@ -357,13 +358,14 @@ def build_workspace(output_root, parent_commit, focus_task, dest, max_trajectori
         cat = "resolved" if r.get("eval_result") == "resolved" else (
             r.get("eval_result") if r.get("eval_result") in ("empty_patch", "incomplete", "error")
             else _failure_category(ev.read_text(errors="replace") if ev.exists() else ""))
-        card = task_records.load_card(r, pred)
-        if card and task_records.feedback_enabled():
-            cat = task_records.failure_class(card)
+        if task_records.feedback_enabled():      # HGM_RECORD_FEEDBACK=1: the card's failure class
+            card = task_records.load_card(r, pred)
+            if card:
+                cat = task_records.failure_class(card)
         rows.append({"task": tid, "eval_result": r.get("eval_result"), "failure_class": cat,
                      "tests_modified": r.get("tests_modified", False), "turns": att.get("turns"),
                      "route": r.get("lc_route"), "agent_error": att.get("error"),
-                     "task_record": r.get("task_record"),
+                     **({"task_record": r.get("task_record")} if task_records.feedback_enabled() else {}),
                      **{k: v for k, v in record_cost(record_prefix(pdir, tid)).items()
                         if k in ("live_calls", "model_s", "uncached_in_plus_out")}})
     (dest / "digest.json").write_text(json.dumps(rows, indent=1))
@@ -419,9 +421,17 @@ def build_workspace(output_root, parent_commit, focus_task, dest, max_trajectori
 
     (dest / "notes.md").write_text(read_notes(pdir))
     (dest / "lineage_evidence.md").write_text(lineage_evidence(root, parent_commit))
-    (dest / "README.md").write_text(WORKSPACE_README.format(parent=parent_commit, focus=focus_task, cap=NOTES_CAP))
+    readme = WORKSPACE_README
+    if task_records.feedback_enabled():
+        readme = readme.replace("- trajectories/<task>.md", RECORDS_README_LINE + "- trajectories/<task>.md", 1)
+    (dest / "README.md").write_text(readme.format(parent=parent_commit, focus=focus_task, cap=NOTES_CAP))
     return rows
 
+
+# Added to the workspace README only with HGM_RECORD_FEEDBACK=1 (task record cards).
+RECORDS_README_LINE = """- task_records.md           when present, observed stop reasons, grading and missing evidence from
+                            several representative tasks; ungraded is not the same as wrong
+"""
 
 WORKSPACE_README = """# Proposer workspace
 
@@ -432,8 +442,6 @@ model is fixed. Your change is kept only if the changed harness solves more task
 Files here (open what you need; do not try to read everything):
 - digest.md / digest.json   results of the current version ({parent}) per task, with a failure class
                             computed from the test logs, turns used and model seconds
-- task_records.md           when present, observed stop reasons, grading and missing evidence from
-                            several representative tasks; ungraded is not the same as wrong
 - trajectories/<task>.md    full agent logs of failed tasks; start with {focus}
 - tests/<task>.txt          the test output of those tasks
 - patch_ledger.jsonl        every earlier version: which files it changed and how it scored

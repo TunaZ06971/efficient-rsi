@@ -1,8 +1,10 @@
 """Host-owned, per-attempt evidence for Polyglot evaluations (no model calls).
 
-Cards are additive. HGM_RECOVER_ANSWERS=1 opts into grading recovered work;
-HGM_RECORD_FEEDBACK=1 opts into using the cards for proposal selection/diagnosis.
-Unknown measurements stay null. The legacy score is retained independently.
+Off unless HGM_TASK_RECORDS=1: with it unset, polyglot/harness.py runs efficient-rsi's evaluation
+code unchanged and nothing here is called. With it set, each attempt also gets a card and grading
+follows the same rules as without it. Two further opt-ins need HGM_TASK_RECORDS=1:
+HGM_RECOVER_ANSWERS=1 grades work recovered after a timeout or crash; HGM_RECORD_FEEDBACK=1 uses the
+cards for proposal selection and diagnosis. Unknown measurements stay null.
 """
 import hashlib
 import json
@@ -16,12 +18,23 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 
+def enabled():
+    return os.getenv("HGM_TASK_RECORDS", "0") == "1"
+
+
 def feedback_enabled():
-    return os.getenv("HGM_RECORD_FEEDBACK", "0") == "1"
+    return enabled() and os.getenv("HGM_RECORD_FEEDBACK", "0") == "1"
 
 
 def recovery_enabled():
-    return os.getenv("HGM_RECOVER_ANSWERS", "0") == "1"
+    return enabled() and os.getenv("HGM_RECOVER_ANSWERS", "0") == "1"
+
+
+def validate_switches():
+    """Called at search start: an opt-in that needs the cards must not silently do nothing."""
+    for name in ("HGM_RECORD_FEEDBACK", "HGM_RECOVER_ANSWERS"):
+        if os.getenv(name, "0") == "1" and not enabled():
+            raise ValueError(f"{name}=1 needs HGM_TASK_RECORDS=1 (it works on the task record cards)")
 
 
 def utc_now():
@@ -140,6 +153,7 @@ class TaskRecord:
         self.collected = False
         self.submitted_patch = None
         self.recovered_patch = None
+        self.trace_collected = self.attempt_collected = False
         self.ledger = os.getenv("RSI_LEDGER")
         try:
             self.ledger_offset = Path(self.ledger).stat().st_size if self.ledger else 0
@@ -226,6 +240,12 @@ class TaskRecord:
         dest = self.dir / name
         try:
             copier(container, src, dest)
+            # copy_from_container unpacks Docker's tar export, which restores a symbolic link as a
+            # link on the host; reading it would read a host file. Keep only regular files.
+            if dest.is_symlink() or not dest.is_file():
+                if dest.is_symlink():
+                    dest.unlink()
+                raise ValueError("not a regular file in the container (symbolic link refused)")
             return dest
         except Exception as exc:
             if required:
@@ -247,6 +267,7 @@ class TaskRecord:
             self.data["data_quality"]["collection_errors"].append({"operation": "stop_writers", "error": str(exc)[:500]})
         self.data["answer"]["writers_stopped"] = quiesced
         trace = self._copy(container, f"/hgm/{self.task}.md", "trajectory.md", copier, required=True)
+        self.trace_collected = trace is not None
         if trace:
             self.data["evidence"]["trace_path"] = str(trace)
             lines = trace.read_text(errors="replace").splitlines()
@@ -264,10 +285,21 @@ class TaskRecord:
             self.data["evidence"]["additional_trace_paths"] = extras
         except Exception as exc:
             self.data["data_quality"]["collection_errors"].append({"operation": "additional_traces", "error": str(exc)[:500]})
-        submitted = self._copy(container, "/hgm/model_patch.diff", "submitted.diff", copier)
-        if submitted and quiesced:
-            self.submitted_patch = submitted.read_text(errors="replace")
+        # The graded patch is read the way efficient-rsi reads it: cat inside the container (a link
+        # resolves inside the container, never on the host). A failed cat leaves it None, and
+        # patch_for_grading then raises, so the attempt is "incomplete" as without records.
+        try:
+            r = container.exec_run("cat /hgm/model_patch.diff")
+            if r.exit_code == 0 and quiesced:
+                self.submitted_patch = r.output.decode()
+                (self.dir / "submitted.diff").write_text(self.submitted_patch)
+            elif r.exit_code != 0:
+                self.data["data_quality"]["collection_errors"].append(
+                    {"file": "/hgm/model_patch.diff", "error": f"cat exited {r.exit_code}"})
+        except Exception as exc:
+            self.data["data_quality"]["collection_errors"].append({"file": "/hgm/model_patch.diff", "error": str(exc)[:500]})
         attempt = self._copy(container, "/hgm/rsi_attempt.json", "agent_attempt.json", copier)
+        self.attempt_collected = attempt is not None
         if attempt:
             a = read_json(attempt) or {}
             self.data["evidence"]["agent_report"] = a
@@ -305,9 +337,17 @@ class TaskRecord:
         self.save()
 
     def patch_for_grading(self):
+        """The patch to grade, under efficient-rsi's rules: an attempt it would record as incomplete
+        (agent exit code not 0, chat log or patch not readable; for little-coder also no
+        rsi_attempt.json) raises here too. Only HGM_RECOVER_ANSWERS=1 grades recovered work."""
         bad_exit = self.data["execution"]["exit_code"] != 0
         if bad_exit and not recovery_enabled():
             raise RuntimeError(f"Agent exited {self.data['execution']['exit_code']}; recovered work retained, grading disabled")
+        if not bad_exit and not recovery_enabled():
+            if not self.trace_collected:
+                raise RuntimeError("Chat log not collected (efficient-rsi records this attempt as incomplete)")
+            if self.data["conditions"]["agent_kind"] == "littlecoder" and not self.attempt_collected:
+                raise RuntimeError("rsi_attempt.json not collected (efficient-rsi records this attempt as incomplete)")
         if not bad_exit and self.submitted_patch is not None:
             return self.submitted_patch
         if recovery_enabled() and self.recovered_patch is not None:
@@ -433,10 +473,11 @@ def load_card(result, prediction_dir):
 def failure_class(card):
     e, g = card.get("execution", {}), card.get("grading", {})
     reason = e.get("stop_reason")
-    if reason in {"hard_timeout", "soft_deadline", "turn_limit", "agent_exception", "request_error"}:
-        return reason
+    # A graded pass is a pass even when the agent stopped on its turn limit or soft deadline.
     if g.get("status") == "passed":
         return "resolved"
+    if reason in {"hard_timeout", "soft_deadline", "turn_limit", "agent_exception", "request_error"}:
+        return reason
     if g.get("status") == "timeout":
         return "test_timeout"
     if g.get("status", "").startswith("invalid"):

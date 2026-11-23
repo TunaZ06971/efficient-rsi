@@ -185,4 +185,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())  # startup failures must remain observable to the host
+    if os.getenv("HGM_TASK_RECORDS") == "1":   # task record cards: a startup failure must reach the host
+        sys.exit(main())
+    try:                                        # otherwise as before: always exit 0
+        main()
+    finally:
+        sys.exit(0)

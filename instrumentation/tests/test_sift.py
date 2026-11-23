@@ -39,6 +39,8 @@ class SiftCase(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {"SIFT_ENFORCE": "0", "SIFT_MODE": "off", "SIFT_ORDER_WEIGHT": "2"})
         self.env.start()
+        for name in ("RSI_LEDGER", "RSI_PROXY_URL", "SIFT_BASE_URL", "HGM_TASK_RECORDS", "HGM_RECORD_FEEDBACK", "HGM_RECOVER_ANSWERS"):
+            os.environ.pop(name, None)          # restored by patch.dict on stop
 
     def tearDown(self):
         self.env.stop()
@@ -152,11 +154,87 @@ class SiftCase(unittest.TestCase):
         self.assertEqual(sift.order_priors([.3], weight=0), [(0.0, 0.0)])
         self.assertEqual(sift.order_priors([None, None], weight=2), [(0.0, 0.0), (0.0, 0.0)])
 
+    def test_startup_rules_original_agent(self):
+        ok_entry = ("import argparse\n" + "".join(f"p.add_argument('--{f}')\n" for f in sift.LAUNCH_FLAGS)
+                    + "if __name__ == '__main__':\n    main()\n")
+        tool = "def tool_info():\n    return {}\ndef tool_function(**kw):\n    return ''\n"
+        def rules(files):
+            return sorted(h["rule"] for h in sift.startup_facts(files, "coding_agent.py", "original")["hard"])
+        base = {"coding_agent.py": ok_entry, "tools/__init__.py": "", "tools/bash.py": tool}
+        self.assertEqual(rules(base), [])
+        self.assertEqual(rules({**base, "coding_agent.py": ok_entry.split("if __name__")[0]}), ["entry"])
+        self.assertEqual(rules({**base, "coding_agent.py": ok_entry.replace("p.add_argument('--timeout')\n", "")}), ["flags"])
+        known = ok_entry.replace("p.add_argument('--timeout')\n", "p.parse_known_args()\n")
+        self.assertEqual(rules({**base, "coding_agent.py": known}), [])
+        self.assertEqual(rules({**base, "tools/x.py": "def tool_info():\n    return {}\n"}), ["tools"])
+        self.assertEqual(rules({**base, "tools/x.py": "from tools.bash import tool_info, tool_function\n"}), [])
+        # syntax: certain only for files that start with the agent
+        broken = "def f(:\n"
+        self.assertEqual(rules({**base, "coding_agent.py": "import helper\n" + ok_entry, "helper.py": broken}), ["syntax"])
+        guarded = "try:\n    import helper\nexcept Exception:\n    pass\n" + ok_entry
+        facts = sift.startup_facts({**base, "coding_agent.py": guarded, "helper.py": broken}, "coding_agent.py", "original")
+        self.assertEqual(facts["hard"], [])
+        self.assertEqual([w["file"] for w in facts["warnings"]], ["helper.py"])
+
+    def test_startup_rules_littlecoder_only_syntax(self):
+        facts = sift.startup_facts({"hgm_agent.py": "import agent\n", "agent.py": "def f(:\n", "tools.py": "x = 1\n"},
+                                   "hgm_agent.py", "littlecoder")
+        self.assertEqual([(h["rule"], h["file"]) for h in facts["hard"]], [("syntax", "agent.py")])
+
+    def test_program_judge_uses_startup_facts_and_qwen_does_not_see_them(self):
+        v = view()
+        v["startup"] = {"hard": [{"rule": "entry", "file": "coding_agent.py", "reason": "x"}], "warnings": []}
+        self.assertEqual(sift.program_judge(v)["action"], "skip")
+        self.assertNotIn("startup", sift.judge_message(v))
+
+    def test_startup_checks_fail_fast(self):
+        bad = [({"SIFT_MODE": "Qwen"}, "SIFT_MODE"),
+               ({"HGM_TASK_RECORDS": "0", "HGM_RECORD_FEEDBACK": "1"}, "HGM_TASK_RECORDS"),
+               ({"SIFT_MODE": "compare", "RSI_LEDGER": "/tmp/ledger.jsonl"}, "RSI_PROXY_URL"),
+               ({"SIFT_MODE": "qwen", "RSI_LEDGER": "/tmp/ledger.jsonl", "RSI_PROXY_URL": "http://127.0.0.1:8787",
+                 "SIFT_BASE_URL": "http://127.0.0.1:8000/v1"}, "SIFT_BASE_URL")]
+        for env, word in bad:
+            with self.subTest(env=env), patch.dict(os.environ, env):
+                with self.assertRaisesRegex(ValueError, word):
+                    sift.validate_startup(1)
+        with patch.dict(os.environ, {"SIFT_MODE": "program", "RSI_LEDGER": "/tmp/ledger.jsonl"}):
+            sift.validate_startup(None)          # no model request in program mode, so no proxy needed
+
+    def test_metered_judge_goes_through_the_proxy_tagged_sift(self):
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                payload = json.dumps(reply(.7)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            def log_message(self, *args):
+                pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        env = {"RSI_LEDGER": "/tmp/unused-ledger.jsonl", "RSI_RUN": "run-a",
+               "RSI_PROXY_URL": f"http://127.0.0.1:{server.server_port}"}
+        try:
+            with patch.dict(os.environ, env):
+                r = sift.qwen_judge(view(), node="child-1")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(r["status"], "scored")
+        self.assertEqual(seen[0][0], "/r/run-a/t/sift/child-1/-/p/vllm/v1/chat/completions")
+        self.assertTrue(seen[0][1]["logprobs"])
+        self.assertEqual(seen[0][1]["chat_template_kwargs"], {"enable_thinking": False})
+
     def test_order_weight_typo_fails_at_startup(self):
         for bad in ("-1", "nan", "inf", "two"):
             with patch.dict(os.environ, {"SIFT_ORDER_WEIGHT": bad}):
                 with self.assertRaises(ValueError):
-                    sift.validate_search_budget(1)
+                    sift.validate_startup(1)
 
     def test_read_order_score_only_in_enforced_qwen_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
